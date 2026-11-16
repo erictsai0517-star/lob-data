@@ -2,7 +2,7 @@ name: record-lob
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # 每 6 小時自動啟動一次
+    - cron: "0 * * * *"     # 每小時排一次隊；配合 concurrency，前一輪一結束，排隊中的下一輪就接著跑
   workflow_dispatch:         # 允許手動啟動（用來測試）
     inputs:
       minutes:
@@ -10,7 +10,7 @@ on:
         default: "3"
 
 permissions:
-  contents: write
+  contents: write            # 建立 Release、上傳檔案需要
 
 concurrency:
   group: record
@@ -19,11 +19,11 @@ concurrency:
 jobs:
   record:
     runs-on: ubuntu-latest
-    timeout-minutes: 345
+    timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
-        symbol: [adausdt, btcusdt]
+        symbol: [btcusdt, ethusdt]
     steps:
       - uses: actions/checkout@v4
 
@@ -32,113 +32,148 @@ jobs:
           python-version: "3.11"
 
       - name: Install
-        run: pip install websockets
+        run: pip install websockets pyarrow
 
       - name: Record
         env:
-          MINUTES: ${{ inputs.minutes || '300' }}
+          MINUTES: ${{ inputs.minutes || '335' }}
           SYMBOL: ${{ matrix.symbol }}
+          PART_MIN: "60"
         run: |
           python - <<'PYEOF'
-          import asyncio, csv, json, os, time
+          import asyncio, json, os, time
+          import pyarrow as pa
+          import pyarrow.parquet as pq
           import websockets
 
           L = 10
           SYMBOL = os.environ["SYMBOL"].lower()
           MINUTES = float(os.environ["MINUTES"])
+          PART_MIN = float(os.environ.get("PART_MIN", "60"))
           BASES = os.environ.get(
               "BASES",
-              "wss://stream.binance.com:9443,wss://data-stream.binance.vision,wss://stream.binance.us:9443",
+              "wss://data-stream.binance.vision,wss://stream.binance.com:9443",
           ).split(",")
           STAMP = time.strftime("%Y%m%d_%H%M", time.gmtime())
           os.makedirs("out", exist_ok=True)
 
+          SNAP_NAMES = ["ts", "u"] + [f"{k}{i}" for k in ("bp", "bq", "ap", "aq") for i in range(1, L + 1)]
+          SNAP = pa.schema([("ts", pa.float64()), ("u", pa.int64())]
+                           + [(n, pa.float64()) for n in SNAP_NAMES[2:]])
+          TRADE = pa.schema([("ts", pa.float64()), ("T", pa.int64()), ("a", pa.int64()),
+                             ("price", pa.float64()), ("qty", pa.float64()), ("side", pa.int8())])
+          EVENT = pa.schema([("ts", pa.float64()), ("msg", pa.string())])
 
-          def make_url(base, sym):
-              return f"{base}/stream?streams={sym}@depth{L}@100ms/{sym}@aggTrade"
+
+          class Part:
+              def __init__(self, name, schema):
+                  self.name, self.schema = name, schema
+                  self.rows, self.idx = [], 0
+
+              def add(self, row):
+                  self.rows.append(row)
+
+              def flush(self):
+                  if not self.rows:
+                      return
+                  self.idx += 1
+                  cols = list(zip(*self.rows))
+                  table = pa.Table.from_arrays(
+                      [pa.array(list(c), type=f.type) for c, f in zip(cols, self.schema)],
+                      schema=self.schema,
+                  )
+                  pq.write_table(table, f"out/{SYMBOL}_{STAMP}_{self.name}_p{self.idx:03d}.parquet",
+                                 compression="zstd")
+                  self.rows = []
 
 
-          async def probe(base, sym):
+          def make_url(base):
+              return f"{base}/stream?streams={SYMBOL}@depth{L}@100ms/{SYMBOL}@aggTrade"
+
+
+          async def probe(base):
               try:
-                  async with websockets.connect(make_url(base, sym), open_timeout=10) as ws:
+                  async with websockets.connect(make_url(base), open_timeout=10) as ws:
                       await asyncio.wait_for(ws.recv(), timeout=10)
                   return True
               except Exception as e:
-                  print("probe fail:", base, sym, type(e).__name__, str(e)[:100], flush=True)
+                  print("probe fail:", base, SYMBOL, type(e).__name__, str(e)[:100], flush=True)
                   return False
 
 
           async def main():
-              syms = [SYMBOL] + ([SYMBOL[:-1]] if SYMBOL.endswith("usdt") else [])
-              base = sym = None
+              base = None
               for b in BASES:
-                  for s in syms:
-                      if await probe(b, s):
-                          base, sym = b, s
-                          break
-                  if base:
+                  if await probe(b):
+                      base = b
                       break
               if not base:
                   print("NO ENDPOINT REACHABLE", flush=True)
                   raise SystemExit(1)
-              print("using", base, sym, flush=True)
+              print("using", base, SYMBOL, flush=True)
 
-              sf = open(f"out/{sym}_{STAMP}_snaps.csv", "w", newline="")
-              tf = open(f"out/{sym}_{STAMP}_trades.csv", "w", newline="")
-              sw, tw = csv.writer(sf), csv.writer(tf)
-              sw.writerow(["ts"] + [f"{k}{i}" for k in ("bp", "bq", "ap", "aq") for i in range(1, L + 1)])
-              tw.writerow(["ts", "price", "qty", "side"])
-              end = time.time() + MINUTES * 60
+              snaps, trades, events = Part("snaps", SNAP), Part("trades", TRADE), Part("events", EVENT)
+              parts = (snaps, trades, events)
+              start = time.time()
+              end = start + MINUTES * 60
+              next_flush = start + PART_MIN * 60
+              last_log = start
               ns = nt = 0
-              last = time.time()
+              events.add((start, "start"))
               try:
                   while time.time() < end:
                       try:
-                          async with websockets.connect(make_url(base, sym), ping_interval=20, open_timeout=10) as ws:
+                          async with websockets.connect(make_url(base), ping_interval=20, open_timeout=10) as ws:
+                              events.add((time.time(), "connected"))
                               while time.time() < end:
                                   msg = await asyncio.wait_for(ws.recv(), timeout=30)
                                   now = time.time()
                                   m = json.loads(msg)
                                   d = m["data"]
                                   if "aggTrade" in m["stream"]:
-                                      tw.writerow([f"{now:.3f}", d["p"], d["q"], -1 if d["m"] else 1])
+                                      trades.add((now, int(d["T"]), int(d["a"]),
+                                                  float(d["p"]), float(d["q"]), -1 if d["m"] else 1))
                                       nt += 1
                                   else:
                                       b, a = d["bids"], d["asks"]
                                       if len(b) < L or len(a) < L:
                                           continue
-                                      sw.writerow([f"{now:.3f}"] + [x[0] for x in b] + [x[1] for x in b]
-                                                  + [x[0] for x in a] + [x[1] for x in a])
+                                      snaps.add((now, int(d["lastUpdateId"]))
+                                                + tuple(float(x[0]) for x in b) + tuple(float(x[1]) for x in b)
+                                                + tuple(float(x[0]) for x in a) + tuple(float(x[1]) for x in a))
                                       ns += 1
-                                  if now - last > 60:
-                                      sf.flush(); tf.flush(); last = now
-                                      if ns % 600 < 20:
-                                          print(f"{ns} snaps, {nt} trades", flush=True)
+                                  if now >= next_flush:
+                                      for p in parts:
+                                          p.flush()
+                                      next_flush = now + PART_MIN * 60
+                                  if now - last_log > 300:
+                                      last_log = now
+                                      print(f"{ns} snaps, {nt} trades", flush=True)
                       except Exception as e:
+                          events.add((time.time(), f"disconnect:{type(e).__name__}"))
                           print("reconnect:", type(e).__name__, str(e)[:100], flush=True)
                           await asyncio.sleep(3)
               finally:
-                  sf.close(); tf.close()
+                  events.add((time.time(), "end"))
+                  for p in parts:
+                      p.flush()
                   print(f"done: {ns} snaps, {nt} trades", flush=True)
 
 
           asyncio.run(main())
           PYEOF
 
-      - name: Save data
+      - name: Upload data to Release
         if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           shopt -s nullglob
-          files=(out/*.csv)
+          files=(out/*.parquet)
           if [ ${#files[@]} -eq 0 ]; then echo "no data"; exit 0; fi
-          gzip -f out/*.csv
-          mkdir -p data
-          mv out/*.gz data/
-          git config user.name "recorder"
-          git config user.email "recorder@users.noreply.github.com"
-          git add data
-          git commit -m "data ${{ matrix.symbol }} $(date -u +%F_%H%M)" || exit 0
-          for i in 1 2 3 4 5 6; do
-            git pull --rebase && git push && break
+          TAG="data-$(date -u +%Y%m%d)"
+          gh release create "$TAG" --title "$TAG" --notes "LOB raw data (parquet)" || true
+          for i in 1 2 3 4 5; do
+            gh release upload "$TAG" "${files[@]}" --clobber && break
             sleep $((RANDOM % 15 + 5))
           done
